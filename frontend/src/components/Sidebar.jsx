@@ -1,4 +1,5 @@
 import { NavLink } from 'react-router-dom';
+import { X } from 'lucide-react';
 import './Sidebar.css';
 
 const NAV = [
@@ -9,7 +10,7 @@ const NAV = [
   { to: '/features',   icon: '📊',  label: 'Feature Importance' },
 ];
 
-export default function Sidebar() {
+export default function Sidebar({ onNavigate, onClose }) {
   return (
     <aside className="sidebar">
       {/* Logo */}
@@ -19,6 +20,9 @@ export default function Sidebar() {
           <span className="sidebar__logo-title">ThreatForecaster</span>
           <span className="sidebar__logo-sub">ML v1.0</span>
         </div>
+        <button type="button" className="sidebar__close" aria-label="Close navigation" onClick={onClose}>
+          <X size={18} />
+        </button>
       </div>
 
       {/* Nav */}
@@ -29,6 +33,7 @@ export default function Sidebar() {
             key={to}
             to={to}
             end={to === '/'}
+            onClick={onNavigate}
             className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}
           >
             <span className="nav-item__icon">{icon}</span>
