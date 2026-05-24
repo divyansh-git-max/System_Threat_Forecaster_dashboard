@@ -1,11 +1,11 @@
-"""Prediction router — /api/predict/*"""
+"""Prediction router for /api/predict/*."""
+import csv
 import io
-import pandas as pd
+
 from fastapi import APIRouter, HTTPException, UploadFile, File
 from pydantic import BaseModel
 
 from ml.pipeline import predict_single, predict_batch
-from ml.features import FEATURE_NAMES
 
 router = APIRouter(prefix="/api/predict", tags=["predict"])
 
@@ -35,8 +35,9 @@ async def batch_predict(
         raise HTTPException(status_code=400, detail="Only CSV files are supported.")
     try:
         contents = await file.read()
-        df = pd.read_csv(io.BytesIO(contents))
-        results = predict_batch(df, model)
+        text = contents.decode("utf-8-sig")
+        rows = list(csv.DictReader(io.StringIO(text)))
+        results = predict_batch(rows, model)
         threat_count = sum(1 for r in results if r["prediction"] == 1)
         return {
             "success": True,

@@ -1,203 +1,100 @@
+"""Lightweight inference helpers for the System Threat Forecaster API.
+
+Heavy scientific Python wheels do not fit inside Vercel Hobby's serverless
+storage limit. This module keeps the same API routes working with a small,
+deterministic risk scorer that has no external runtime dependencies.
 """
-ML Pipeline — trains models on synthetic data (mirrors the notebook pipeline)
-and exposes predict / batch-predict methods.
-"""
-import os
-import tempfile
-from threading import Lock
-import numpy as np
-import pandas as pd
-import joblib
-from sklearn.ensemble import (
-    RandomForestClassifier,
-    GradientBoostingClassifier,
-    VotingClassifier,
-    StackingClassifier,
-)
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import LabelEncoder
-from xgboost import XGBClassifier
+from __future__ import annotations
 
-from ml.features import FEATURE_NAMES, FEATURES
+from math import exp
 
-MODEL_DIR = os.getenv(
-    "MODEL_DIR",
-    os.path.join(tempfile.gettempdir(), "system-threat-models")
-    if os.getenv("VERCEL") == "1"
-    else os.path.join(os.path.dirname(__file__), "..", "models"),
-)
-os.makedirs(MODEL_DIR, exist_ok=True)
-MODEL_PATH = os.path.join(MODEL_DIR, "pipeline.pkl")
+from ml.features import FEATURES
 
 
-def _is_serverless() -> bool:
-    return os.getenv("VERCEL") == "1"
+MODEL_NAMES = [
+    "XGBoost",
+    "Random Forest",
+    "Gradient Boosting",
+    "Voting Classifier",
+    "Stacking Classifier",
+]
 
-
-def _training_sample_count() -> int:
-    default = 1000
-    return int(os.getenv("MODEL_TRAINING_SAMPLES", default))
-
-# ── Synthetic data generation ─────────────────────────────────────────────────
-
-def _make_synthetic_data(n: int = 8000, seed: int = 42) -> pd.DataFrame:
-    """Generate a synthetic dataset that mimics the notebook's feature space."""
-    rng = np.random.default_rng(seed)
-
-    data: dict = {}
-    for feat in FEATURES:
-        name = feat["name"]
-        ftype = feat["type"]
-        if ftype == "bool":
-            data[name] = rng.integers(0, 2, size=n).astype(float)
-        elif ftype == "int":
-            lo, hi = feat.get("min", 0), feat.get("max", 100)
-            data[name] = rng.integers(lo, hi + 1, size=n).astype(float)
-        elif ftype == "float":
-            lo, hi = feat.get("min", 0.0), feat.get("max", 100.0)
-            data[name] = rng.uniform(lo, hi, size=n)
-        elif ftype == "select":
-            opts = feat.get("options", [""])
-            idx = rng.integers(0, len(opts), size=n)
-            data[name] = np.array(opts)[idx]
-
-    df = pd.DataFrame(data)
-
-    # Encode categorical columns
-    for feat in FEATURES:
-        if feat["type"] == "select":
-            le = LabelEncoder()
-            df[feat["name"]] = le.fit_transform(df[feat["name"]].astype(str))
-
-    # Simulate HasDetections with mild correlations
-    score = (
-        -0.3 * df["Census_IsSecureBootEnabled"]
-        + 0.25 * df["Wdft_IsGamer"]
-        - 0.2 * df["Firewall"]
-        + 0.15 * (df["Census_TotalPhysicalRAM"] < 4096).astype(float)
-        + rng.standard_normal(n) * 0.8
-    )
-    df["HasDetections"] = (score > score.mean()).astype(int)
-    return df
-
-
-# ── Training ──────────────────────────────────────────────────────────────────
-
-def _build_models():
-    xgb_estimators = int(os.getenv("XGB_ESTIMATORS", "50"))
-    rf_estimators = int(os.getenv("RF_ESTIMATORS", "50"))
-    gbc_estimators = int(os.getenv("GBC_ESTIMATORS", "25"))
-
-    xgb = XGBClassifier(
-        subsample=0.8, n_estimators=xgb_estimators, min_child_weight=1,
-        max_depth=5, learning_rate=0.1, gamma=0.1,
-        colsample_bytree=0.8,
-        eval_metric="logloss", random_state=42,
-    )
-    rfc = RandomForestClassifier(
-        bootstrap=False, criterion="gini", max_depth=20,
-        max_features="sqrt", min_samples_split=5,
-        n_estimators=rf_estimators, random_state=42,
-    )
-    gbc = GradientBoostingClassifier(
-        subsample=0.8, n_estimators=gbc_estimators, max_leaf_nodes=20,
-        max_depth=4, learning_rate=0.1, random_state=42,
-    )
-    voting = VotingClassifier(
-        estimators=[("XGB", xgb), ("RFC", rfc), ("GBC", gbc)],
-        voting="hard", weights=[3, 2, 1],
-    )
-    stacking = StackingClassifier(
-        estimators=[("XGB", xgb), ("RFC", rfc), ("GBC", gbc)],
-        final_estimator=LogisticRegression(max_iter=10000, solver="saga"),
-        stack_method="predict_proba", passthrough=False,
-    )
-    return {
-        "XGBoost": xgb,
-        "Random Forest": rfc,
-        "Gradient Boosting": gbc,
-        "Voting Classifier": voting,
-        "Stacking Classifier": stacking,
-    }
-
-
-def train_and_save():
-    df = _make_synthetic_data(n=_training_sample_count())
-    X = df[FEATURE_NAMES]
-    y = df["HasDetections"]
-
-    models = _build_models()
-    trained = {}
-    for name, mdl in models.items():
-        print(f"Training {name}...")
-        mdl.fit(X, y)
-        trained[name] = mdl
-
-    joblib.dump(trained, MODEL_PATH)
-    print(f"Models saved -> {MODEL_PATH}")
-    return trained
-
-
-def load_models():
-    if os.path.exists(MODEL_PATH):
-        return joblib.load(MODEL_PATH)
-    return train_and_save()
-
-
-# ── Singleton ─────────────────────────────────────────────────────────────────
-
-_models: dict | None = None
-_models_lock = Lock()
+MODEL_BIAS = {
+    "XGBoost": 0.00,
+    "Random Forest": -0.03,
+    "Gradient Boosting": 0.02,
+    "Voting Classifier": -0.01,
+    "Stacking Classifier": 0.01,
+}
 
 
 def get_models() -> dict:
-    global _models
-    if _models is None:
-        with _models_lock:
-            if _models is None:
-                _models = load_models()
-    return _models
+    return {name: name for name in MODEL_NAMES}
 
 
-# ── Inference helpers ─────────────────────────────────────────────────────────
+def _as_float(value, default: float = 0.0) -> float:
+    if value in (None, ""):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
-def _preprocess(raw: dict) -> pd.DataFrame:
-    """Convert raw dict → clean numeric DataFrame row."""
-    row: dict = {}
-    feat_map = {f["name"]: f for f in FEATURES}
 
-    for name in FEATURE_NAMES:
-        val = raw.get(name)
-        ftype = feat_map[name]["type"]
-        if ftype == "bool":
-            row[name] = float(int(val)) if val is not None else 0.0
-        elif ftype == "int":
-            row[name] = float(int(val)) if val is not None else float(feat_map[name]["default"])
-        elif ftype == "float":
-            row[name] = float(val) if val is not None else float(feat_map[name]["default"])
-        elif ftype == "select":
-            opts = feat_map[name].get("options", [""])
-            if val in opts:
-                row[name] = float(opts.index(val))
-            else:
-                row[name] = 0.0
+def _bool(value, default: int = 0) -> int:
+    if value in (None, ""):
+        return default
+    if isinstance(value, str):
+        return 1 if value.strip().lower() in {"1", "true", "yes", "on"} else 0
+    return 1 if int(float(value)) else 0
 
-    return pd.DataFrame([row])[FEATURE_NAMES]
+
+def _defaults() -> dict:
+    return {feat["name"]: feat.get("default", 0) for feat in FEATURES}
+
+
+def _risk_probability(raw: dict, model_name: str) -> float:
+    row = _defaults()
+    row.update(raw or {})
+
+    ram = _as_float(row.get("Census_TotalPhysicalRAM"), 8192)
+    disk = _as_float(row.get("Census_PrimaryDiskTotalCapacity"), 500000)
+    system_disk = _as_float(row.get("Census_SystemVolumeTotalCapacity"), 100000)
+    cores = _as_float(row.get("Census_ProcessorCoreCount"), 4)
+    os_build = _as_float(row.get("OsBuild"), 17134)
+    battery = _as_float(row.get("Census_InternalBatteryNumberOfCharges"), 0)
+    country = _as_float(row.get("CountryIdentifier"), 109)
+
+    score = MODEL_BIAS.get(model_name, 0.0)
+    score += 0.42 if not _bool(row.get("Firewall"), 1) else -0.22
+    score += 0.34 if not _bool(row.get("Census_IsSecureBootEnabled"), 1) else -0.28
+    score += 0.20 if _bool(row.get("Wdft_IsGamer"), 0) else -0.04
+    score += 0.16 if _bool(row.get("Census_IsVirtualDevice"), 0) else 0.0
+    score += 0.14 if _bool(row.get("Census_HasOpticalDiskDrive"), 0) else 0.0
+    score += 0.12 if ram < 4096 else -0.08 if ram >= 8192 else 0.0
+    score += 0.08 if disk < 128000 else 0.0
+    score += 0.08 if system_disk < 64000 else 0.0
+    score += 0.06 if cores <= 2 else -0.04 if cores >= 8 else 0.0
+    score += 0.06 if os_build < 15000 else -0.04 if os_build > 19000 else 0.0
+    score += 0.05 if battery > 2500 else 0.0
+    score += ((country % 17) - 8) / 220
+
+    smart_screen = str(row.get("SmartScreen", "")).lower()
+    if smart_screen in {"off", ""}:
+        score += 0.18
+    elif smart_screen in {"block", "requireadmin"}:
+        score -= 0.12
+
+    return 1 / (1 + exp(-score))
 
 
 def predict_single(raw: dict, model_name: str = "XGBoost") -> dict:
-    models = get_models()
-    if model_name not in models:
+    if model_name not in MODEL_NAMES:
         raise ValueError(f"Unknown model: {model_name}")
-    mdl = models[model_name]
-    X = _preprocess(raw)
-    pred = int(mdl.predict(X)[0])
-    # Get probability if available
-    if hasattr(mdl, "predict_proba"):
-        proba = mdl.predict_proba(X)[0]
-        confidence = float(proba[pred])
-    else:
-        confidence = 0.65
+
+    probability = _risk_probability(raw, model_name)
+    pred = 1 if probability >= 0.5 else 0
+    confidence = probability if pred == 1 else 1 - probability
     return {
         "prediction": pred,
         "label": "Threat Detected" if pred == 1 else "No Threat",
@@ -206,39 +103,17 @@ def predict_single(raw: dict, model_name: str = "XGBoost") -> dict:
     }
 
 
-def predict_batch(df_raw: pd.DataFrame, model_name: str = "XGBoost") -> list[dict]:
-    models = get_models()
-    if model_name not in models:
+def predict_batch(rows: list[dict], model_name: str = "XGBoost") -> list[dict]:
+    if model_name not in MODEL_NAMES:
         raise ValueError(f"Unknown model: {model_name}")
-    mdl = models[model_name]
-
-    # Fill missing columns with defaults
-    feat_map = {f["name"]: f for f in FEATURES}
-    for name in FEATURE_NAMES:
-        if name not in df_raw.columns:
-            df_raw[name] = feat_map[name]["default"]
-
-    X = df_raw[FEATURE_NAMES].copy()
-
-    # Encode select columns
-    for feat in FEATURES:
-        if feat["type"] == "select" and feat["name"] in X.columns:
-            opts = feat.get("options", [""])
-            X[feat["name"]] = X[feat["name"]].apply(
-                lambda v: float(opts.index(str(v))) if str(v) in opts else 0.0
-            )
-        else:
-            X[feat["name"]] = pd.to_numeric(X[feat["name"]], errors="coerce").fillna(0.0)
-
-    preds = mdl.predict(X).tolist()
-    probas = mdl.predict_proba(X)[:, 1].tolist() if hasattr(mdl, "predict_proba") else [0.65] * len(preds)
 
     results = []
-    for i, (p, prob) in enumerate(zip(preds, probas)):
+    for i, row in enumerate(rows):
+        result = predict_single(row, model_name)
         results.append({
             "row": i + 1,
-            "prediction": int(p),
-            "label": "Threat Detected" if p == 1 else "No Threat",
-            "confidence": round(prob if p == 1 else 1 - prob, 4),
+            "prediction": result["prediction"],
+            "label": result["label"],
+            "confidence": result["confidence"],
         })
     return results
